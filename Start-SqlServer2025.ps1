@@ -13,8 +13,8 @@ in Windows PowerShell and ISE. No SQL installation package is hosted here.
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Open Windows PowerShell as Administrator, then run this command again.'
     }
-    Write-Host 'SQL Server 2025 Express | MSSQLSERVER | sa | random allowed TCP port'
-    Write-Host 'SQL Server license terms: https://aka.ms/useterms'
+    Write-Host 'SQL Server 2025 Express + SSMS 22 | MSSQLSERVER | sa | random allowed TCP port'
+    Write-Host 'SQL Server and SSMS license terms: https://aka.ms/useterms'
     $accept = Read-Host 'Do you accept the SQL Server license terms and start installation? Type YES'
     if ($accept -ine 'YES') { Write-Host 'Installation cancelled.'; return }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -39,7 +39,7 @@ in Windows PowerShell and ISE. No SQL installation package is hosted here.
     & $installer -AcceptLicenseTerms
     $result = $LASTEXITCODE
     if ($result -eq 3010) {
-        Write-Warning 'SQL Setup requires a Windows restart. Windows was NOT restarted. After scheduling a restart, complete configuration with:'
+        Write-Warning 'An installer requires a Windows restart. Windows was NOT restarted. Review the messages above: if SSMS requested it, database configuration is already complete; do not rerun ConfigureOnly. Only if SQL engine setup stopped before configuration, run after restart:'
         Write-Host "& '$installer' -ConfigureOnly"
     } elseif ($result -ne 0) {
         throw "Installation/configuration failed (exit code $result). Script saved at $installer. Review C:\ProgramData\SqlServerInstallLogs."
