@@ -1,10 +1,13 @@
 <#
 GitHub launcher. Supports IEX (DownloadString(...)) and direct execution.
-The installer runs in a child Windows PowerShell process so exit does not close
-the caller's shell. No SQL installation package is hosted in this repository.
+The installer runs as a script in the current host so secure password input works
+in Windows PowerShell and ISE. No SQL installation package is hosted here.
 #>
 & {
     $ErrorActionPreference = 'Stop'
+    if (-not [Environment]::Is64BitProcess) {
+        throw 'Open 64-bit Windows PowerShell as Administrator, then run this command again.'
+    }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -25,15 +28,13 @@ the caller's shell. No SQL installation package is hosted in this repository.
     $parseErrors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$parseTokens, [ref]$parseErrors)
     if ($parseErrors.Count -gt 0) { throw 'Downloaded script is invalid. Check the GitHub file.' }
-    $powershellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not [Environment]::Is64BitProcess) {
-        $powershellPath = Join-Path $env:WINDIR 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
-    }
-    & $powershellPath -NoProfile -ExecutionPolicy Bypass -File $installer -AcceptLicenseTerms
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
+    Write-Host 'Starting in the current PowerShell host. The sa password prompt will appear here.' -ForegroundColor Cyan
+    & $installer -AcceptLicenseTerms
     $result = $LASTEXITCODE
     if ($result -eq 3010) {
         Write-Warning 'SQL Setup requires a Windows restart. Windows was NOT restarted. After scheduling a restart, complete configuration with:'
-        Write-Host "& '$powershellPath' -NoProfile -ExecutionPolicy Bypass -File '$installer' -ConfigureOnly"
+        Write-Host "& '$installer' -ConfigureOnly"
     } elseif ($result -ne 0) {
         throw "Installation/configuration failed (exit code $result). Script saved at $installer. Review C:\ProgramData\SqlServerInstallLogs."
     }
