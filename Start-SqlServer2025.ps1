@@ -18,12 +18,18 @@ in Windows PowerShell and ISE. No SQL installation package is hosted here.
     $accept = Read-Host 'Do you accept the SQL Server license terms and start installation? Type YES'
     if ($accept -ine 'YES') { Write-Host 'Installation cancelled.'; return }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $uri = 'https://raw.githubusercontent.com/shangchuanji/kabuto/main/Install-SqlServer.ps1'
+    $uri = 'https://raw.githubusercontent.com/shangchuanji/kabuto/main/Install-SqlServer.ps1?nocache=' + [guid]::NewGuid().ToString('N')
     $folder = Join-Path $env:TEMP ('SQL2025Express-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $folder
     $installer = Join-Path $folder 'Install-SqlServer.ps1'
     Write-Host "Downloading installer script to $installer"
-    Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+    Invoke-WebRequest -Uri $uri -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' } -OutFile $installer -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+    $downloadedSource = Get-Content -LiteralPath $installer -Raw
+    if ($downloadedSource -notmatch 'function Get-FullMedia' -or $downloadedSource -match '/ACTION=Download /MEDIATYPE=Expr') {
+        throw 'Outdated installer received. Upload the direct-download version of Install-SqlServer.ps1 to main, then retry. No installation was started.'
+    }
+    Write-Host 'Verified installer: direct full-package download (no SSEI Download action).' -ForegroundColor Green
+    Write-Host ('Installer SHA256: ' + (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash)
     $parseTokens = $null
     $parseErrors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$parseTokens, [ref]$parseErrors)
