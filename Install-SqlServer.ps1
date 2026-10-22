@@ -12,7 +12,7 @@ Download and install SQL Server 2025 Express, then configure its TCP port and fi
 param(
     [string]$MediaPath,
     [string]$DownloadDirectory = "$env:ProgramData\SqlServer2025ExpressMedia",
-    [uri]$DownloadUrl = 'https://download.microsoft.com/download/7ab8f535-7eb8-4b16-82eb-eca0fa2d38f3/SQL2025-SSEI-Expr.exe',
+    [uri]$DownloadUrl = 'https://download.microsoft.com/download/dea8c210-c44a-4a9d-9d80-0c81578860c5/ENU/SQLEXPR_x64_ENU.exe',
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,15}$')][string]$InstanceName = 'MSSQLSERVER',
     [ValidateRange(512,2147483647)][int]$MaxServerMemoryMB = 4096,
     [switch]$EnforceSaPasswordPolicy,
@@ -44,6 +44,59 @@ function Quote-SetupValue([string]$Value) {
 
 function Write-Stage([string]$Message) {
     Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message) -ForegroundColor Cyan
+}
+
+function Get-FullMedia([uri]$Uri, [string]$Destination) {
+    # No SSEI bootstrapper: download the full signed self-extracting package.
+    $total = -1L
+    try {
+        $head = [Net.WebRequest]::Create($Uri)
+        $head.Method = 'HEAD'
+        $head.Timeout = 15000
+        $response = $head.GetResponse()
+        try { $total = $response.ContentLength } finally { $response.Close() }
+    } catch { Write-Warning 'Download size unavailable; progress will show bytes and elapsed time.' }
+    for ($retry = 1; $retry -le 3; $retry++) {
+        $client = [Net.WebClient]::new()
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $lastReport = -10
+        try {
+            Write-Stage "[2/7] Direct full-package download, attempt $retry of 3."
+            $task = $client.DownloadFileTaskAsync($Uri, $Destination)
+            while (-not $task.IsCompleted) {
+                $seconds = [int]$watch.Elapsed.TotalSeconds
+                if ($seconds -gt 3600) { $client.CancelAsync(); throw 'Download exceeded the 60-minute attempt limit.' }
+                if ($seconds - $lastReport -ge 10) {
+                    $bytes = 0L
+                    if (Test-Path -LiteralPath $Destination) { $bytes = (Get-Item -LiteralPath $Destination).Length }
+                    $status = '{0:N1} MB received; elapsed {1}s' -f ($bytes / 1MB), $seconds
+                    $percent = -1
+                    if ($total -gt 0) {
+                        $percent = [Math]::Min(99, [int](100.0 * $bytes / $total))
+                        $status += ('; total {0:N1} MB; {1}%' -f ($total / 1MB), $percent)
+                    }
+                    Write-Stage $status
+                    Write-Progress -Id 11 -Activity 'Downloading SQL Server 2025 Express' -Status $status -PercentComplete $percent
+                    $lastReport = $seconds
+                }
+                Start-Sleep -Milliseconds 500
+            }
+            $task.GetAwaiter().GetResult()
+            $length = (Get-Item -LiteralPath $Destination).Length
+            if ($length -le 0) { throw 'Downloaded package is empty.' }
+            if ($total -gt 0 -and $length -ne $total) { throw 'Downloaded size does not match the server response.' }
+            Write-Stage ('Download complete: {0:N1} MB.' -f ($length / 1MB))
+            return
+        } catch {
+            if ($retry -eq 3) { throw }
+            Write-Warning "Download failed: $($_.Exception.Message). Retrying from the beginning."
+        } finally {
+            $client.CancelAsync()
+            $client.Dispose()
+            Write-Progress -Id 11 -Activity 'Downloading SQL Server 2025 Express' -Completed
+        }
+        Start-Sleep -Seconds 3
+    }
 }
 
 function Invoke-TrackedProcess {
@@ -178,38 +231,15 @@ if ([string]::IsNullOrWhiteSpace($MediaPath)) {
     $downloadRoot = (Resolve-Path -LiteralPath $DownloadDirectory).ProviderPath
     $runDirectory = Join-Path $downloadRoot ([guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $runDirectory
-    $bootstrapper = Join-Path $runDirectory 'SQL2025-SSEI-Expr.exe'
+    $package = Join-Path $runDirectory 'SQLEXPR_x64_ENU.exe'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    Write-Stage "[2/7] Downloading SQL Server 2025 Express bootstrapper from $DownloadUrl"
-    $oldProgress = $ProgressPreference
-    try {
-        $ProgressPreference = 'Continue'
-        for ($retry = 1; $retry -le 3; $retry++) {
-            try {
-                Write-Stage "Bootstrapper download attempt $retry of 3 (request timeout: 300 seconds)."
-                Invoke-WebRequest -Uri $DownloadUrl -OutFile $bootstrapper -UseBasicParsing -TimeoutSec 300
-                break
-            } catch {
-                if ($retry -eq 3) { throw }
-                Start-Sleep -Seconds 3
-            }
-        }
-    } finally { $ProgressPreference = $oldProgress }
-    Write-Stage 'Checking bootstrapper Microsoft signature...'
-    Assert-MicrosoftSignature $bootstrapper
-    $mediaDirectory = Join-Path $runDirectory 'Media'
-    $null = New-Item -ItemType Directory -Path $mediaDirectory
-    Write-Host 'Downloading full English Express media from Microsoft. This can take several minutes.'
-    $downloadArgs = '/ACTION=Download /MEDIATYPE=Expr /LANGUAGE=en-US /QUIET /IACCEPTSQLSERVERLICENSETERMS /MEDIAPATH=' + (Quote-SetupValue $mediaDirectory)
-    $downloadCode = Invoke-TrackedProcess -FilePath $bootstrapper -ArgumentLine $downloadArgs -Activity '[3/7] Downloading full Express media' -WatchDirectory $mediaDirectory
-    if ($downloadCode -ne 0) { throw "Media download failed: $downloadCode. Files: $runDirectory" }
-    $packages = @(Get-ChildItem -LiteralPath $mediaDirectory -Filter 'SQLEXPR*x64*.exe' -File -Recurse)
-    if ($packages.Count -ne 1) { throw "Expected one full Express package; found $($packages.Count) in $mediaDirectory." }
-    Write-Stage 'Checking full media Microsoft signature...'
-    Assert-MicrosoftSignature $packages[0].FullName
+    Write-Stage "Downloading full SQL Server 2025 Express directly from $DownloadUrl"
+    Get-FullMedia -Uri $DownloadUrl -Destination $package
+    Write-Stage '[3/7] Checking full media Microsoft signature...'
+    Assert-MicrosoftSignature $package
     $extractDirectory = Join-Path $runDirectory 'Extracted'
     Write-Host "Extracting SQL Server media to $extractDirectory"
-    $extractCode = Invoke-TrackedProcess -FilePath $packages[0].FullName -ArgumentLine ('/Q /X:' + (Quote-SetupValue $extractDirectory)) -Activity '[4/7] Extracting media' -WatchDirectory $extractDirectory
+    $extractCode = Invoke-TrackedProcess -FilePath $package -ArgumentLine ('/Q /X:' + (Quote-SetupValue $extractDirectory)) -Activity '[4/7] Extracting media' -WatchDirectory $extractDirectory
     if ($extractCode -ne 0) { throw "Media extraction failed: $extractCode." }
     $MediaPath = $extractDirectory
 }
