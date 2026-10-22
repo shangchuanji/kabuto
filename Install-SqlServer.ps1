@@ -42,9 +42,59 @@ function Quote-SetupValue([string]$Value) {
     return '"' + $Value + '"'
 }
 
+function Write-Stage([string]$Message) {
+    Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message) -ForegroundColor Cyan
+}
+
+function Invoke-TrackedProcess {
+    param([string]$FilePath, [string]$ArgumentLine, [string]$Activity, [string]$WatchDirectory)
+    Write-Stage "$Activity - starting (elapsed time is not a completion percentage)."
+    # Keep Start-Process -Wait semantics, including descendant processes.
+    $job = Start-Job -ArgumentList $FilePath,$ArgumentLine -ScriptBlock {
+        param($file, $arguments)
+        $ErrorActionPreference = 'Stop'
+        $p = Start-Process -FilePath $file -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+        $p.ExitCode
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lastReport = -10
+    try {
+        while ($job.State -in @('NotStarted','Running')) {
+            $seconds = [int]$watch.Elapsed.TotalSeconds
+            if ($seconds - $lastReport -ge 10) {
+                $status = "Running; elapsed $seconds seconds"
+                if ($WatchDirectory -and (Test-Path -LiteralPath $WatchDirectory)) {
+                    $files = @(Get-ChildItem -LiteralPath $WatchDirectory -File -Recurse -ErrorAction SilentlyContinue)
+                    $bytes = 0
+                    if ($files.Count -gt 0) { $bytes = ($files | Measure-Object -Property Length -Sum).Sum }
+                    $status += ('; observed folder size {0:N1} MB (not total download progress)' -f ($bytes / 1MB))
+                    $latest = $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    if ($null -ne $latest) { $status += "; latest file update $($latest.LastWriteTime.ToString('HH:mm:ss'))" }
+                }
+                Write-Stage "$Activity : $status"
+                Write-Progress -Id 10 -Activity $Activity -Status $status -PercentComplete -1
+                $lastReport = $seconds
+            }
+            $null = Wait-Job -Job $job -Timeout 1
+        }
+        $output = @(Receive-Job -Job $job -ErrorAction Stop)
+        if ($job.State -ne 'Completed' -or $output.Count -ne 1) {
+            throw "$Activity process monitoring failed. Check running setup processes and logs before retrying."
+        }
+        $code = [int]$output[0]
+        Write-Stage "$Activity finished; exit code $code; elapsed $([int]$watch.Elapsed.TotalSeconds) seconds."
+        return $code
+    } finally {
+        Write-Progress -Id 10 -Activity $Activity -Completed
+        if ($job.State -in @('Completed','Failed','Stopped')) { Remove-Job -Job $job }
+    }
+}
+
 function Read-SaPassword {
     while ($true) {
+        Write-Stage '[1/7] INPUT REQUIRED: enter a new sa password below, then press Enter. Input is hidden.'
         $first = Read-Host 'Set sa password (12-128 characters; at least 3 of uppercase/lowercase/digits/symbols)' -AsSecureString
+        Write-Stage 'INPUT REQUIRED: enter the same password again, then press Enter.'
         $second = Read-Host 'Confirm sa password' -AsSecureString
         $a = $null
         $b = $null
@@ -130,12 +180,13 @@ if ([string]::IsNullOrWhiteSpace($MediaPath)) {
     $null = New-Item -ItemType Directory -Path $runDirectory
     $bootstrapper = Join-Path $runDirectory 'SQL2025-SSEI-Expr.exe'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    Write-Host "Downloading SQL Server 2025 Express bootstrapper from $DownloadUrl"
+    Write-Stage "[2/7] Downloading SQL Server 2025 Express bootstrapper from $DownloadUrl"
     $oldProgress = $ProgressPreference
     try {
-        $ProgressPreference = 'SilentlyContinue'
+        $ProgressPreference = 'Continue'
         for ($retry = 1; $retry -le 3; $retry++) {
             try {
+                Write-Stage "Bootstrapper download attempt $retry of 3 (request timeout: 300 seconds)."
                 Invoke-WebRequest -Uri $DownloadUrl -OutFile $bootstrapper -UseBasicParsing -TimeoutSec 300
                 break
             } catch {
@@ -144,20 +195,22 @@ if ([string]::IsNullOrWhiteSpace($MediaPath)) {
             }
         }
     } finally { $ProgressPreference = $oldProgress }
+    Write-Stage 'Checking bootstrapper Microsoft signature...'
     Assert-MicrosoftSignature $bootstrapper
     $mediaDirectory = Join-Path $runDirectory 'Media'
     $null = New-Item -ItemType Directory -Path $mediaDirectory
     Write-Host 'Downloading full English Express media from Microsoft. This can take several minutes.'
     $downloadArgs = '/ACTION=Download /MEDIATYPE=Expr /LANGUAGE=en-US /QUIET /IACCEPTSQLSERVERLICENSETERMS /MEDIAPATH=' + (Quote-SetupValue $mediaDirectory)
-    $downloadProcess = Start-Process -FilePath $bootstrapper -ArgumentList $downloadArgs -Wait -PassThru
-    if ($downloadProcess.ExitCode -ne 0) { throw "Media download failed: $($downloadProcess.ExitCode). Files: $runDirectory" }
+    $downloadCode = Invoke-TrackedProcess -FilePath $bootstrapper -ArgumentLine $downloadArgs -Activity '[3/7] Downloading full Express media' -WatchDirectory $mediaDirectory
+    if ($downloadCode -ne 0) { throw "Media download failed: $downloadCode. Files: $runDirectory" }
     $packages = @(Get-ChildItem -LiteralPath $mediaDirectory -Filter 'SQLEXPR*x64*.exe' -File -Recurse)
     if ($packages.Count -ne 1) { throw "Expected one full Express package; found $($packages.Count) in $mediaDirectory." }
+    Write-Stage 'Checking full media Microsoft signature...'
     Assert-MicrosoftSignature $packages[0].FullName
     $extractDirectory = Join-Path $runDirectory 'Extracted'
     Write-Host "Extracting SQL Server media to $extractDirectory"
-    $extractProcess = Start-Process -FilePath $packages[0].FullName -ArgumentList ('/Q /X:' + (Quote-SetupValue $extractDirectory)) -Wait -PassThru
-    if ($extractProcess.ExitCode -ne 0) { throw "Media extraction failed: $($extractProcess.ExitCode)." }
+    $extractCode = Invoke-TrackedProcess -FilePath $packages[0].FullName -ArgumentLine ('/Q /X:' + (Quote-SetupValue $extractDirectory)) -Activity '[4/7] Extracting media' -WatchDirectory $extractDirectory
+    if ($extractCode -ne 0) { throw "Media extraction failed: $extractCode." }
     $MediaPath = $extractDirectory
 }
 $resolvedMedia = (Resolve-Path -LiteralPath $MediaPath).ProviderPath
@@ -237,8 +290,9 @@ try {
     $setup = Resolve-SqlSetup
     $mediaMajor = 17
     Write-Host "Starting $setup"
-    $process = Start-Process -FilePath $setup -ArgumentList ($arguments -join ' ') -Wait -PassThru
-    $exitCode = $process.ExitCode
+    $setupLogs = "$env:ProgramFiles\Microsoft SQL Server\170\Setup Bootstrap\Log"
+    Write-Stage "SQL Setup logs: $setupLogs"
+    $exitCode = Invoke-TrackedProcess -FilePath $setup -ArgumentLine ($arguments -join ' ') -Activity '[5/7] Installing SQL Server' -WatchDirectory $setupLogs
     Write-Host "SQL Setup exit code: $exitCode"
     Write-Host "SQL Setup logs: $env:ProgramFiles\Microsoft SQL Server\${mediaMajor}0\Setup Bootstrap\Log"
     if ($exitCode -notin @(0,3010)) { throw "SQL Setup failed ($exitCode). Review Summary.txt and Detail.txt in the SQL Setup log directory." }
@@ -257,6 +311,7 @@ try {
         throw 'The installed instance is not SQL Server 2025 Express. Network configuration stopped; use Express installation media.'
     }
     Add-Type -AssemblyName System.Data
+    Write-Stage '[6/7] Configuring sa, authentication, memory and TCP port...'
     Start-Service -Name $serviceName
     Enable-SaLogin -Password $saPassword
     $tcp = "$root\MSSQLServer\SuperSocketNetLib\Tcp"
@@ -285,6 +340,7 @@ try {
         Set-ItemProperty $_.PSPath -Name TcpDynamicPorts -Value ''
         Set-ItemProperty $_.PSPath -Name TcpPort -Value ([string]$port)
     }
+    Write-Stage "Restarting SQL service $serviceName; selected TCP port: $port"
     Restart-Service -Name $serviceName -ErrorAction Stop
     $listening = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
@@ -296,6 +352,7 @@ try {
         Start-Sleep -Seconds 2
     }
     if (-not $listening) { throw "SQL Server is not listening on $port. Check the SQL error log; firewall rule has not been opened." }
+    Write-Stage '[7/7] Verifying sa TCP login and configuring firewall...'
     $testConnection = [System.Data.SqlClient.SqlConnection]::new("Data Source=tcp:127.0.0.1,$port;Initial Catalog=master;Encrypt=True;TrustServerCertificate=True;Pooling=False;Connect Timeout=30")
     try {
         $testConnection.Credential = [System.Data.SqlClient.SqlCredential]::new('sa', $saPassword)
