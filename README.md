@@ -37,5 +37,3 @@ SQL 安装日志：C:\Program Files\Microsoft SQL Server\170\Setup Bootstrap\Log
 主脚本支持 -MediaPath 指定离线介质、-RemoteAddress 限制来源、-MaxServerMemoryMB 修改内存配置、-EnforceSaPasswordPolicy 启用 SQL 密码策略、-CheckOnly 仅本机预检查。
 
 本机验证连接启用加密并信任本机证书；外部客户端应配置实际证书信任。云安全组、网络防火墙和域策略仍会影响访问。
-
-文件仅在本地生成，尚未上传 GitHub。未在三个 Windows Server 系统实际安装，真实下载安装和数据库登录仍需验证。
