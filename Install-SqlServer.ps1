@@ -13,7 +13,9 @@ param(
     [string]$MediaPath,
     [string]$DownloadDirectory = "$env:ProgramData\SqlServer2025ExpressMedia",
     [uri]$DownloadUrl = 'https://download.microsoft.com/download/7ab8f535-7eb8-4b16-82eb-eca0fa2d38f3/SQL2025-SSEI-Expr.exe',
-    [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,15}$')][string]$InstanceName = 'SQLEXPRESS',
+    [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,15}$')][string]$InstanceName = 'MSSQLSERVER',
+    [ValidateRange(512,2147483647)][int]$MaxServerMemoryMB = 4096,
+    [switch]$EnforceSaPasswordPolicy,
     [string[]]$SqlSysAdminAccounts = @([Security.Principal.WindowsIdentity]::GetCurrent().Name),
     [string]$LogDirectory = "$env:ProgramData\SqlServerInstallLogs",
     [string[]]$RemoteAddress = @('Any'),
@@ -67,19 +69,35 @@ function Enable-SaLogin([Security.SecureString]$Password) {
     $connection = [System.Data.SqlClient.SqlConnection]::new("Data Source=$source;Integrated Security=True;Initial Catalog=master;Encrypt=True;TrustServerCertificate=True;Pooling=False;Connect Timeout=30")
     $command = $connection.CreateCommand()
     $command.CommandText = @'
-DECLARE @statement nvarchar(max) = N'ALTER LOGIN [sa] WITH PASSWORD = ' + QUOTENAME(@password, '''') + N', CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;';
+DECLARE @statement nvarchar(max) = N'ALTER LOGIN [sa] WITH CHECK_EXPIRATION = OFF, CHECK_POLICY = OFF; ALTER LOGIN [sa] WITH PASSWORD = ' + QUOTENAME(@password, '''') + N';';
 EXEC sys.sp_executesql @statement;
+IF @enforcePolicy = 1 ALTER LOGIN [sa] WITH CHECK_POLICY = ON;
 ALTER LOGIN [sa] ENABLE;
 EXEC master.dbo.xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2;
+DECLARE @oldAdvanced int = (SELECT CONVERT(int, value_in_use) FROM sys.configurations WHERE name = N'show advanced options');
+IF @oldAdvanced = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE; END;
+BEGIN TRY
+    EXEC sys.sp_configure N'max server memory (MB)', @memoryMB;
+    RECONFIGURE;
+END TRY
+BEGIN CATCH
+    IF @oldAdvanced = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 0; RECONFIGURE; END;
+    THROW;
+END CATCH;
+IF @oldAdvanced = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 0; RECONFIGURE; END;
 '@
     try {
         $connection.Open()
         $parameter = $command.Parameters.Add('@password', [System.Data.SqlDbType]::NVarChar, 128)
         $parameter.Value = ([PSCredential]::new('sa', $Password)).GetNetworkCredential().Password
+        $null = $command.Parameters.Add('@memoryMB', [System.Data.SqlDbType]::Int)
+        $command.Parameters['@memoryMB'].Value = $MaxServerMemoryMB
+        $null = $command.Parameters.Add('@enforcePolicy', [System.Data.SqlDbType]::Bit)
+        $command.Parameters['@enforcePolicy'].Value = $EnforceSaPasswordPolicy.IsPresent
         $null = $command.ExecuteNonQuery()
     } catch {
         # Do not write SQL exception text: it can contain parts of the submitted statement.
-        throw 'Could not configure sa. Check Windows SQL administrator access and the local password policy, then rerun -ConfigureOnly.'
+        throw 'Could not configure sa or memory. Check Windows SQL administrator access and password settings, then rerun -ConfigureOnly.'
     } finally {
         $command.Parameters.Clear()
         $command.Dispose()
@@ -180,11 +198,11 @@ $rebootKeys = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
 )
 foreach ($key in $rebootKeys) {
-    if (Test-Path $key) { throw 'Windows requires a restart. Restart before installing SQL Server.' }
+    if (Test-Path $key) { Write-Warning 'Windows has a pending restart marker. Continuing; SQL Setup will evaluate prerequisites. This script will not restart Windows.' }
 }
 $pending = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
 if ($null -ne $pending -and $pending.PendingFileRenameOperations) {
-    throw 'Pending file operations require a Windows restart before SQL Server installation.'
+    Write-Warning 'Pending file operations detected. Continuing; SQL Setup will evaluate prerequisites. This script will not restart Windows.'
 }
 if (-not $ConfigureOnly -and -not $AcceptLicenseTerms -and -not $CheckOnly) { throw 'Read the SQL Server license and specify -AcceptLicenseTerms to install.' }
 
@@ -214,6 +232,7 @@ $exitCode = 1
 $saPassword = $null
 Start-Transcript -Path $transcript | Out-Null
 try {
+    $saPassword = Read-SaPassword
     if (-not $ConfigureOnly) {
     $setup = Resolve-SqlSetup
     $mediaMajor = 17
@@ -229,8 +248,9 @@ try {
     }
     }
     $exitCode = 1
-    $instanceId = (Get-ItemProperty $instanceKey).PSObject.Properties[$InstanceName].Value
-    if (-not $instanceId) { throw 'Installed instance not found.' }
+    $instanceProperty = (Get-ItemProperty $instanceKey).PSObject.Properties[$InstanceName]
+    if ($null -eq $instanceProperty) { throw 'Installed instance not found. Specify the correct -InstanceName.' }
+    $instanceId = $instanceProperty.Value
     $root = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId"
     $installed = Get-ItemProperty "$root\Setup"
     if ($installed.Edition -notmatch 'Express' -or $installed.Version -notmatch '^17\.') {
@@ -238,7 +258,6 @@ try {
     }
     Add-Type -AssemblyName System.Data
     Start-Service -Name $serviceName
-    $saPassword = Read-SaPassword
     Enable-SaLogin -Password $saPassword
     $tcp = "$root\MSSQLServer\SuperSocketNetLib\Tcp"
     $existingPort = [string](Get-ItemProperty "$tcp\IPAll").TcpPort
@@ -300,6 +319,7 @@ try {
     [ordered]@{ Instance = $InstanceName; Edition = $installed.Edition; Port = $port; Connection = "tcp:$env:COMPUTERNAME,$port"; Authentication = 'SQL Server and Windows'; Login = 'sa'; FirewallRule = $ruleName; RemoteAddress = $RemoteAddress } | ConvertTo-Json | Set-Content -LiteralPath $resultFile -Encoding UTF8
     Write-Host "Ready: tcp:$env:COMPUTERNAME,$port (SQL Server authentication; login: sa; password: the value you entered)"
     Write-Host "Connection details saved to $resultFile"
+    Write-Host "Max server memory setting: $MaxServerMemoryMB MB; sa password policy enforced: $($EnforceSaPasswordPolicy.IsPresent)"
     $exitCode = 0
 } catch {
     if ($exitCode -in @(0,3010)) { $exitCode = 1 }
