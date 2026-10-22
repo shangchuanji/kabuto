@@ -20,6 +20,8 @@ param(
     [string]$LogDirectory = "$env:ProgramData\SqlServerInstallLogs",
     [string[]]$RemoteAddress = @('Any'),
     [switch]$ConfigureOnly,
+    [switch]$SsmsOnly,
+    [switch]$SkipSsms,
     [switch]$AcceptLicenseTerms,
     [switch]$CheckOnly
 )
@@ -261,6 +263,59 @@ if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notm
 }
 return $setup
 }
+
+function Install-Ssms {
+    $installationType = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').InstallationType
+    if ($installationType -eq 'Server Core') {
+        throw 'SSMS requires a supported desktop environment. Install SSMS on a management PC; use -SkipSsms for engine-only setup.'
+    }
+    $installPath = Join-Path $env:ProgramFiles 'Microsoft SQL Server Management Studio 22\Release'
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere) {
+        $found = @(& $vswhere -products Microsoft.VisualStudio.Product.Ssms -version '[22.0,23.0)' -property installationPath)
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($location in $found) {
+                if (Test-Path -LiteralPath (Join-Path $location 'Common7\IDE\Ssms.exe')) {
+                    Write-Stage "SSMS 22 already installed: $location"
+                    return 0
+                }
+            }
+        }
+    }
+    $folder = Join-Path $DownloadDirectory ('SSMS-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $folder -Force
+    $bootstrapper = Join-Path $folder 'vs_SSMS.exe'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Write-Stage '[SSMS] Downloading Microsoft SSMS 22 installer...'
+    Invoke-WebRequest -Uri 'https://aka.ms/ssms/22/release/vs_SSMS.exe' -OutFile $bootstrapper -UseBasicParsing -TimeoutSec 300
+    Assert-MicrosoftSignature $bootstrapper
+    Write-Stage "[SSMS] Installing management tools. Installer logs: $env:TEMP\dd_*"
+    $ssmsArgs = '--quiet --wait --norestart --addProductLang en-US --installPath ' + (Quote-SetupValue $installPath)
+    $ssmsCode = Invoke-TrackedProcess -FilePath $bootstrapper -ArgumentLine $ssmsArgs -Activity '[SSMS] Installing SSMS 22'
+    if ($ssmsCode -eq 3010) {
+        Write-Warning 'SSMS Setup reports success with a restart required. Windows has NOT been restarted. SQL engine settings are unchanged.'
+        return 3010
+    }
+    if ($ssmsCode -ne 0) { throw "SSMS installation failed ($ssmsCode). Check $env:TEMP\dd_* logs. Retry with -SsmsOnly; do not reinstall SQL Server." }
+    $executable = Join-Path $installPath 'Common7\IDE\Ssms.exe'
+    if (-not (Test-Path -LiteralPath $executable)) { throw 'SSMS Setup returned success but Ssms.exe was not found. Check the installer logs; retry with -SsmsOnly.' }
+    Write-Stage "SSMS installed: $executable"
+    return 0
+}
+
+# SSMS-only mode branches before SQL instance, password, port and firewall logic.
+if ($SsmsOnly) {
+    if ($ConfigureOnly -or $SkipSsms) { throw '-SsmsOnly cannot be combined with -ConfigureOnly or -SkipSsms.' }
+    if ($CheckOnly) { Write-Host 'SSMS-only precheck; no installation performed.'; return }
+    if (-not $AcceptLicenseTerms) { throw 'Specify -AcceptLicenseTerms after reading the Microsoft SSMS license terms.' }
+    $null = New-Item -ItemType Directory -Path $LogDirectory -Force
+    Start-Transcript -Path (Join-Path $LogDirectory ('SSMS-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')) | Out-Null
+    $ssmsExit = 1
+    try { $ssmsExit = Install-Ssms }
+    catch { Write-Error -Message $_.Exception.Message -ErrorAction Continue }
+    finally { Stop-Transcript | Out-Null }
+    exit $ssmsExit
+}
 if (-not $SqlSysAdminAccounts -or $SqlSysAdminAccounts.Count -eq 0) { throw 'Specify at least one Windows SQL administrator.' }
 # The executing Windows account configures sa over local shared memory after setup.
 $SqlSysAdminAccounts = @($SqlSysAdminAccounts + @([Security.Principal.WindowsIdentity]::GetCurrent().Name) | Select-Object -Unique)
@@ -408,6 +463,10 @@ try {
     Write-Host "Connection details saved to $resultFile"
     Write-Host "Max server memory setting: $MaxServerMemoryMB MB; sa password policy enforced: $($EnforceSaPasswordPolicy.IsPresent)"
     $exitCode = 0
+    if (-not $SkipSsms -and -not $ConfigureOnly) {
+        Write-Stage 'SQL database configuration complete. Installing SSMS management tools next.'
+        $exitCode = Install-Ssms
+    }
 } catch {
     if ($exitCode -in @(0,3010)) { $exitCode = 1 }
     Write-Error -Message $_.Exception.Message -ErrorAction Continue
